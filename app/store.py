@@ -8,6 +8,7 @@ or no version at all (SQLite rolls the partial transaction back on recovery).
 """
 from __future__ import annotations
 
+import json
 import os
 import sqlite3
 from pathlib import Path
@@ -15,7 +16,13 @@ from typing import Iterable
 
 from .domain import (
     ArchiveStorageError,
+    DestructionCertificate,
+    NoticeDestroyed,
+    NotYetDueForDestruction,
+    NothingToDestroy,
+    VersionFingerprint,
     VersionRecord,
+    parse_iso_instant,
     utc_now_iso,
 )
 
@@ -62,6 +69,15 @@ CREATE TABLE IF NOT EXISTS capture_log (
     revision        INTEGER,
     detail          TEXT NOT NULL,
     created_at      TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS destruction_certificates (
+    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
+    announcement_number TEXT NOT NULL UNIQUE,
+    cutoff_at           TEXT NOT NULL,
+    destroyed_at        TEXT NOT NULL,
+    version_count       INTEGER NOT NULL,
+    fingerprints_json   TEXT NOT NULL
 );
 """
 
@@ -171,7 +187,11 @@ class ArchiveStore:
                            SELECT v3.title FROM versions v3
                            WHERE v3.announcement_number = a.number
                            ORDER BY v3.revision DESC LIMIT 1
-                       ) AS latest_title
+                       ) AS latest_title,
+                       (
+                           SELECT dc.destroyed_at FROM destruction_certificates dc
+                           WHERE dc.announcement_number = a.number
+                       ) AS destroyed_at
                 FROM announcements a
                 LEFT JOIN versions v ON v.announcement_number = a.number
                 GROUP BY a.number
@@ -230,6 +250,19 @@ class ArchiveStore:
         now = record.captured_at or utc_now_iso()
         try:
             conn.execute("BEGIN IMMEDIATE")
+            # A destruction certificate is permanent: the same number must not
+            # be able to re-capture original evidence once it has been destroyed.
+            destroyed = conn.execute(
+                "SELECT 1 FROM destruction_certificates "
+                "WHERE announcement_number = ?",
+                (record.announcement_number,),
+            ).fetchone()
+            if destroyed:
+                conn.execute("ROLLBACK")
+                raise NoticeDestroyed(
+                    f"公告 {record.announcement_number} 已办理销毁并留有凭证，"
+                    "同号重采被拒绝，已销毁证据不会重现。"
+                )
             existing = conn.execute(
                 "SELECT 1 FROM versions WHERE announcement_number = ? "
                 "AND revision = ?",
@@ -305,6 +338,9 @@ class ArchiveStore:
             )
             conn.execute("COMMIT")
             return True
+        except NoticeDestroyed:
+            # Already rolled back above; surface the domain error untouched.
+            raise
         except sqlite3.Error as exc:
             try:
                 conn.execute("ROLLBACK")
@@ -408,6 +444,159 @@ class ArchiveStore:
             raise ArchiveStorageError(f"无法记录采集事件：{exc}") from exc
         finally:
             conn.close()
+
+    # ------------------------------------------------------------- destruction
+
+    def is_destroyed(self, number: str) -> bool:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT 1 FROM destruction_certificates "
+                "WHERE announcement_number = ?",
+                (number,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return row is not None
+
+    def get_certificate(self, number: str) -> DestructionCertificate | None:
+        conn = self._connect()
+        try:
+            row = conn.execute(
+                "SELECT * FROM destruction_certificates "
+                "WHERE announcement_number = ?",
+                (number,),
+            ).fetchone()
+        finally:
+            conn.close()
+        return self._row_to_certificate(row) if row else None
+
+    def destroy_announcement(self, number: str, cutoff_iso: str) -> DestructionCertificate:
+        """Destroy every version's body and attachment in one transaction.
+
+        Eligibility is decided against the versions visible at commit time: the
+        whole announcement may be destroyed only when every version's
+        ``captured_at`` is strictly earlier than the cutoff. If any revision is
+        not yet due (including one captured while this request was in flight),
+        the transaction rolls back, no certificate is written and the complete
+        archive stays intact. Any storage failure likewise rolls back.
+        """
+        cutoff = parse_iso_instant(cutoff_iso)
+        conn = self._connect()
+        destroyed_at = utc_now_iso()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            rows = conn.execute(
+                "SELECT revision, body_revision, attachment_revision, "
+                "body_sha256, attachment_sha256, content_hash, captured_at "
+                "FROM versions WHERE announcement_number = ? "
+                "ORDER BY revision ASC",
+                (number,),
+            ).fetchall()
+            if not rows:
+                conn.execute("ROLLBACK")
+                raise NothingToDestroy(
+                    f"公告 {number} 没有可销毁的存档版本，未产生销毁凭证。"
+                )
+
+            fingerprints: list[VersionFingerprint] = []
+            for row in rows:
+                captured = parse_iso_instant(row["captured_at"])
+                if not captured < cutoff:
+                    conn.execute("ROLLBACK")
+                    raise NotYetDueForDestruction(
+                        f"销毁被拒：版本 r{row['revision']} 的采集时间 "
+                        f"{row['captured_at']} 不早于截止时刻 {cutoff_iso}；"
+                        "完整档案已保留，未产生销毁凭证。"
+                    )
+                fingerprints.append(
+                    VersionFingerprint(
+                        revision=row["revision"],
+                        body_revision=row["body_revision"],
+                        attachment_revision=row["attachment_revision"],
+                        body_sha256=row["body_sha256"],
+                        attachment_sha256=row["attachment_sha256"],
+                        content_hash=row["content_hash"],
+                        captured_at=row["captured_at"],
+                    )
+                )
+
+            payload = json.dumps(
+                [f.__dict__ for f in fingerprints],
+                ensure_ascii=False,
+                sort_keys=True,
+            )
+            conn.execute(
+                """
+                INSERT INTO destruction_certificates
+                    (announcement_number, cutoff_at, destroyed_at,
+                     version_count, fingerprints_json)
+                VALUES (?, ?, ?, ?, ?)
+                """,
+                (
+                    number,
+                    cutoff_iso,
+                    destroyed_at,
+                    len(fingerprints),
+                    payload,
+                ),
+            )
+            # Remove the originals: body text and attachment bytes go together.
+            conn.execute(
+                "DELETE FROM versions WHERE announcement_number = ?", (number,)
+            )
+            conn.execute(
+                """
+                INSERT INTO capture_log
+                    (announcement_number, outcome, revision, detail, created_at)
+                VALUES (?, ?, NULL, ?, ?)
+                """,
+                (
+                    number,
+                    "destroyed",
+                    f"保管期满销毁 {len(fingerprints)} 个版本，"
+                    f"截止时刻 {cutoff_iso}，原件已删除，凭证留存各修订指纹",
+                    destroyed_at,
+                ),
+            )
+            conn.execute("COMMIT")
+        except (NothingToDestroy, NotYetDueForDestruction):
+            raise
+        except sqlite3.Error as exc:
+            try:
+                conn.execute("ROLLBACK")
+            except sqlite3.Error:
+                pass
+            raise ArchiveStorageError(f"销毁失败，原档完整保留且未产生凭证：{exc}") from exc
+        finally:
+            conn.close()
+
+        certificate = self.get_certificate(number)
+        assert certificate is not None
+        return certificate
+
+    @staticmethod
+    def _row_to_certificate(row: sqlite3.Row) -> DestructionCertificate:
+        raw = json.loads(row["fingerprints_json"])
+        fingerprints = tuple(
+            VersionFingerprint(
+                revision=item["revision"],
+                body_revision=item["body_revision"],
+                attachment_revision=item["attachment_revision"],
+                body_sha256=item["body_sha256"],
+                attachment_sha256=item["attachment_sha256"],
+                content_hash=item["content_hash"],
+                captured_at=item["captured_at"],
+            )
+            for item in raw
+        )
+        return DestructionCertificate(
+            announcement_number=row["announcement_number"],
+            cutoff_at=row["cutoff_at"],
+            destroyed_at=row["destroyed_at"],
+            version_count=row["version_count"],
+            fingerprints=fingerprints,
+        )
 
     @staticmethod
     def _row_to_record(row: sqlite3.Row) -> VersionRecord:

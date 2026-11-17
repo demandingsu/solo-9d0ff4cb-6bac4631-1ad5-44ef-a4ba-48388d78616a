@@ -80,6 +80,8 @@
       <td>
         {% if e.outcome == "created" %}<span class="pill current">新建版本</span>
         {% elif e.outcome == "unchanged" %}<span class="pill">无变化</span>
+        {% elif e.outcome == "destroyed" %}<span class="pill retracted">已销毁</span>
+        {% elif e.outcome == "capture_blocked_destroyed" %}<span class="pill conflict">重采被拒</span>
         {% elif e.outcome in ("conflict","revision_mismatch","source_inconsistent") %}
           <span class="pill conflict">{{ e.outcome }}</span>
         {% else %}<span class="pill retracted">{{ e.outcome }}</span>{% endif %}
@@ -100,6 +102,22 @@
     <input type="hidden" name="number" value="{{ number }}">
     <button type="submit">重新采集 / 核对源站</button>
     <span class="meta">若源站已在同号修订下改稿，将报告冲突且不覆盖旧版。</span>
+  </form>
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">保管期满销毁</h2>
+  <p class="meta">
+    仅当该公告号<strong>所有版本</strong>的采集时间都严格早于所填 UTC 截止时刻时方可办理。
+    销毁将删除各版本正文与附件原件，仅留存记录公告号、各修订指纹与销毁时间的凭证；
+    销毁失败会保留完整档案且不产生凭证，重复办理返回原凭证。
+  </p>
+  <form method="post" action="/destroy" class="inline-form">
+    <input type="hidden" name="number" value="{{ number }}">
+    <label for="cutoff" style="margin:0">UTC 截止时刻</label>
+    <input id="cutoff" type="text" name="cutoff" required
+           placeholder="例如 2026-12-31T23:59:59Z" style="max-width:300px">
+    <button type="submit" class="danger-btn">办理销毁</button>
   </form>
 </div>
 {% endblock %}

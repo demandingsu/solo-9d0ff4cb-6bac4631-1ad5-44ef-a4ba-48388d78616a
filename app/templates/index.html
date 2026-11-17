@@ -26,11 +26,14 @@
   {% for a in announcements %}
     <tr>
       <td><a href="/notice/{{ a.number|urlencode }}">{{ a.number }}</a></td>
-      <td>{{ a.latest_title }}</td>
+      <td>{% if a.destroyed_at %}<span class="meta">原件已销毁，仅凭证可查</span>
+          {% else %}{{ a.latest_title }}{% endif %}</td>
       <td>{{ a.version_count }}</td>
-      <td>r{{ a.latest_revision }}</td>
+      <td>{% if a.latest_revision %}r{{ a.latest_revision }}{% else %}—{% endif %}</td>
       <td>
-        {% if a.source_retracted %}
+        {% if a.destroyed_at %}
+          <span class="pill retracted">已销毁</span>
+        {% elif a.source_retracted %}
           <span class="pill retracted">源站已撤稿</span>
         {% else %}
           <span class="pill">在发</span>
@@ -59,6 +62,8 @@
       <td>
         {% if e.outcome == "created" %}<span class="pill current">新建版本</span>
         {% elif e.outcome == "unchanged" %}<span class="pill">无变化</span>
+        {% elif e.outcome == "destroyed" %}<span class="pill retracted">已销毁</span>
+        {% elif e.outcome == "capture_blocked_destroyed" %}<span class="pill conflict">重采被拒</span>
         {% elif e.outcome in ("conflict","revision_mismatch","source_inconsistent") %}
           <span class="pill conflict">{{ e.outcome }}</span>
         {% elif e.outcome in ("not_found","withdrawn","source_unavailable") %}

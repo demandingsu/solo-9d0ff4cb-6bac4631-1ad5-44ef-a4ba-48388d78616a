@@ -11,9 +11,14 @@ from fastapi.responses import HTMLResponse, RedirectResponse, Response
 from fastapi.templating import Jinja2Templates
 
 from .capture import CaptureService
+from .destruction import DestructionService
 from .domain import (
     ArchiveStorageError,
+    InvalidCutoff,
     InvalidNumber,
+    NoticeDestroyed,
+    NotYetDueForDestruction,
+    NothingToDestroy,
     SourceError,
     format_bytes,
     format_timestamp,
@@ -43,6 +48,7 @@ def create_app(
         client=source_client,
     )
     service = CaptureService(store, source)
+    destruction = DestructionService(store)
     templates = Jinja2Templates(directory=str(BASE_DIR / "templates"))
     templates.env.filters["bytes"] = format_bytes
     templates.env.filters["ts"] = format_timestamp
@@ -61,6 +67,7 @@ def create_app(
     app.state.store = store
     app.state.source = source
     app.state.service = service
+    app.state.destruction = destruction
 
     @app.get("/", response_class=HTMLResponse)
     def index(request: Request):
@@ -81,6 +88,9 @@ def create_app(
             result = service.capture(number)
         except InvalidNumber as exc:
             return _error_redirect("", exc.message)
+        except NoticeDestroyed as exc:
+            clean = number.strip()
+            return _error_redirect(clean, exc.message)
         except (SourceError, ArchiveStorageError) as exc:
             return _error_redirect(number.strip(), exc.message)
         return RedirectResponse(
@@ -88,8 +98,40 @@ def create_app(
             status_code=303,
         )
 
+    @app.post("/destroy")
+    def destroy(number: str = Form(...), cutoff: str = Form(...)):
+        try:
+            result = destruction.destroy(number, cutoff)
+        except InvalidNumber as exc:
+            return _error_redirect("", exc.message)
+        except InvalidCutoff as exc:
+            return _error_redirect(number.strip(), exc.message)
+        except (NothingToDestroy, NotYetDueForDestruction, ArchiveStorageError) as exc:
+            return _error_redirect(number.strip(), exc.message)
+        target = (
+            f"/notice/{quote(result.certificate.announcement_number, safe='')}"
+            f"?destroy={result.status}"
+        )
+        return RedirectResponse(target, status_code=303)
+
     @app.get("/notice/{number}", response_class=HTMLResponse)
     def notice(request: Request, number: str):
+        certificate = store.get_certificate(number)
+        if certificate is not None:
+            return templates.TemplateResponse(
+                request,
+                "destroyed.html",
+                {
+                    "number": number,
+                    "certificate": certificate,
+                    "events": store.events_for(number),
+                    "destroy_status": request.query_params.get("destroy"),
+                    "destroy_message": _DESTROY_MESSAGES.get(
+                        request.query_params.get("destroy")
+                    ),
+                    "error": request.query_params.get("error"),
+                },
+            )
         versions = store.list_versions(number)
         if not versions:
             return templates.TemplateResponse(
@@ -116,12 +158,14 @@ def create_app(
 
     @app.get("/notice/{number}/version/{revision}", response_class=HTMLResponse)
     def version(request: Request, number: str, revision: int):
+        if store.is_destroyed(number):
+            return _gone_page(request, number)
         record = store.get_version(number, revision)
         if record is None:
             return templates.TemplateResponse(
                 request,
                 "not_found.html",
-                {"number": number, "error": "该版本不存在"},
+                {"number": number, "error": "该版本不存在或已随销毁删除。"},
                 status_code=404,
             )
         all_versions = store.list_versions(number)
@@ -133,6 +177,14 @@ def create_app(
 
     @app.get("/notice/{number}/version/{revision}/attachment")
     def download(number: str, revision: int):
+        if store.is_destroyed(number):
+            raise HTTPException(
+                status_code=410,
+                detail=(
+                    f"公告 {number} 已办理销毁，附件原件已删除，"
+                    "仅可在公告页查看销毁凭证。"
+                ),
+            )
         record = store.get_version(number, revision)
         if record is None:
             raise HTTPException(status_code=404, detail="该版本附件不存在")
@@ -153,6 +205,17 @@ def create_app(
     def healthz():
         return {"status": "ok"}
 
+    def _gone_page(request: Request, number: str):
+        return templates.TemplateResponse(
+            request,
+            "gone.html",
+            {
+                "number": number,
+                "certificate": store.get_certificate(number),
+            },
+            status_code=410,
+        )
+
     return app
 
 
@@ -161,6 +224,11 @@ _STATUS_MESSAGES = {
     "unchanged": "相同修订号且内容一致：未重复建版。",
     "conflict": "采集被拒：源站冲突，旧版未覆盖。",
     "retracted_update": "已记录源站撤稿状态变化，未新建版本。",
+}
+
+_DESTROY_MESSAGES = {
+    "destroyed": "销毁完成：正文与附件原件已删除，销毁凭证已留存。",
+    "already_destroyed": "该公告此前已销毁：以下为原销毁凭证，未重复办理。",
 }
 
 

@@ -55,6 +55,22 @@ class ArchiveStorageError(ArchiveError):
     pass
 
 
+class InvalidCutoff(ArchiveError):
+    pass
+
+
+class NothingToDestroy(ArchiveError):
+    pass
+
+
+class NotYetDueForDestruction(ArchiveError):
+    pass
+
+
+class NoticeDestroyed(ArchiveError):
+    pass
+
+
 def normalize_number(value: str) -> str:
     number = (value or "").strip()
     if not number or not NUMBER_RE.fullmatch(number):
@@ -70,6 +86,50 @@ def utc_now_iso() -> str:
         .isoformat(timespec="seconds")
         .replace("+00:00", "Z")
     )
+
+
+def parse_utc_cutoff(value: str) -> datetime:
+    """Parse a UTC cutoff instant submitted by the archivist.
+
+    Only timezone-aware instants are accepted; a naive value is rejected so the
+    operator cannot accidentally pass local time as UTC. The returned value is
+    always a timezone-aware UTC datetime.
+    """
+    text = (value or "").strip()
+    if not text:
+        raise InvalidCutoff("截止时刻无效：请填写 UTC 时间，例如 2026-12-31T23:59:59Z。")
+    if len(text) > 100:
+        raise InvalidCutoff("截止时刻无效：输入过长。")
+    candidate = text
+    if candidate.endswith(("Z", "z")):
+        candidate = candidate[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(candidate)
+    except ValueError as exc:
+        raise InvalidCutoff(
+            "截止时刻无效：请使用 ISO 8601 的 UTC 时间，"
+            "例如 2026-12-31T23:59:59Z。"
+        ) from exc
+    if parsed.tzinfo is None or parsed.utcoffset() is None:
+        raise InvalidCutoff("截止时刻无效：必须带 UTC 时区（以 Z 或 +00:00 结尾）。")
+    return parsed.astimezone(timezone.utc)
+
+
+def cutoff_to_iso(cutoff: datetime) -> str:
+    """Render a UTC cutoff datetime in the same Z-suffixed ISO form we store."""
+    return (
+        cutoff.astimezone(timezone.utc)
+        .isoformat(timespec="seconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def parse_iso_instant(value: str) -> datetime:
+    """Parse a stored Z-suffixed ISO instant into a timezone-aware datetime."""
+    text = value.strip()
+    if text.endswith(("Z", "z")):
+        text = text[:-1] + "+00:00"
+    return datetime.fromisoformat(text).astimezone(timezone.utc)
 
 
 def sha256_bytes(data: bytes) -> str:
@@ -229,6 +289,40 @@ class VersionRecord:
 
 
 CaptureStatus = Literal["created", "unchanged", "conflict", "retracted_update"]
+
+
+DestructionStatus = Literal["destroyed", "already_destroyed", "rejected"]
+
+
+@dataclass(frozen=True)
+class VersionFingerprint:
+    """Verifiable evidence of one destroyed revision, holding no originals."""
+
+    revision: int
+    body_revision: int
+    attachment_revision: int
+    body_sha256: str
+    attachment_sha256: str
+    content_hash: str
+    captured_at: str
+
+
+@dataclass(frozen=True)
+class DestructionCertificate:
+    """The destruction voucher: fingerprints and timing, never original text."""
+
+    announcement_number: str
+    cutoff_at: str
+    destroyed_at: str
+    version_count: int
+    fingerprints: tuple[VersionFingerprint, ...]
+
+
+@dataclass(frozen=True)
+class DestructionResult:
+    status: DestructionStatus
+    certificate: DestructionCertificate
+    message: str
 
 
 @dataclass(frozen=True)

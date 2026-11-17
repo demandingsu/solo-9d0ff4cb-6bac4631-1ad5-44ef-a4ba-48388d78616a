@@ -1,0 +1,17 @@
+{% extends "base.html" %}
+{% block title %}原件已销毁 · 公告 {{ number }}{% endblock %}
+{% block content %}
+<div class="card">
+  <h1>该版本原件已销毁（HTTP 410）</h1>
+  <p>公告号 <strong>{{ number }}</strong> 已办理保管期满销毁，旧版正文页面与附件下载入口
+     不再提供任何原件。</p>
+  {% if certificate %}
+  <p class="meta">
+    销毁时间：{{ certificate.destroyed_at|ts }} ·
+    销毁版本数：{{ certificate.version_count }}
+  </p>
+  {% endif %}
+  <p><a href="/notice/{{ number|urlencode }}">查看销毁凭证（仅含各修订指纹）</a></p>
+  <p><a href="/">返回档案首页</a></p>
+</div>
+{% endblock %}

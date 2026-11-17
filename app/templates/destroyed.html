@@ -1,0 +1,78 @@
+{% extends "base.html" %}
+{% block title %}{{ number }} 销毁凭证 · 公告档案{% endblock %}
+{% block content %}
+{% if error %}<div class="banner err">{{ error }}</div>{% endif %}
+{% if destroy_message %}
+<div class="banner {% if destroy_status == 'already_destroyed' %}warn{% endif %}">{{ destroy_message }}</div>
+{% endif %}
+
+<h1>公告 {{ number }} · 销毁凭证</h1>
+<div class="banner err">
+  该公告保管期满，正文与全部附件原件已于
+  <strong>{{ certificate.destroyed_at|ts }}</strong> 销毁；本页仅留存可核查的销毁凭证，
+  不含任何原件内容。同号重采将被拒绝。
+</div>
+
+<div class="card">
+  <h2 style="margin-top:0">凭证信息</h2>
+  <dl class="kv">
+    <dt>公告号</dt><dd>{{ certificate.announcement_number }}</dd>
+    <dt>申报截止时刻（UTC）</dt><dd>{{ certificate.cutoff_at|ts }}</dd>
+    <dt>实际销毁时间（UTC）</dt><dd>{{ certificate.destroyed_at|ts }}</dd>
+    <dt>销毁版本数</dt><dd>{{ certificate.version_count }}</dd>
+  </dl>
+</div>
+
+<h2>各修订销毁指纹（不含原件）</h2>
+<div class="card" style="padding:4px 10px">
+<table>
+  <thead>
+    <tr><th>修订</th><th>采集时间（UTC）</th><th>正文 SHA-256</th>
+        <th>附件 SHA-256</th><th>内容指纹</th></tr>
+  </thead>
+  <tbody>
+  {% for f in certificate.fingerprints %}
+    <tr>
+      <td>r{{ f.revision }}
+        <span class="meta">（正文 r{{ f.body_revision }} / 附件 r{{ f.attachment_revision }}）</span></td>
+      <td class="meta">{{ f.captured_at|ts }}</td>
+      <td><code>{{ f.body_sha256 }}</code></td>
+      <td><code>{{ f.attachment_sha256 }}</code></td>
+      <td><code>{{ f.content_hash }}</code></td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+<p class="meta">销毁规则：仅当该公告号所有版本的采集时间均严格早于截止时刻时方可办理；
+指纹用于与外部留存的哈希记录核对，凭证明细与删除在同一数据库事务中完成。</p>
+
+<h2>核对记录</h2>
+{% if events %}
+<div class="card" style="padding:4px 10px">
+<table>
+  <thead><tr><th>时间</th><th>结果</th><th>修订</th><th>说明</th></tr></thead>
+  <tbody>
+  {% for e in events %}
+    <tr>
+      <td class="meta">{{ e.created_at|ts }}</td>
+      <td>
+        {% if e.outcome == "destroyed" %}<span class="pill retracted">已销毁</span>
+        {% elif e.outcome == "capture_blocked_destroyed" %}<span class="pill conflict">重采被拒</span>
+        {% elif e.outcome == "created" %}<span class="pill current">新建版本</span>
+        {% elif e.outcome == "unchanged" %}<span class="pill">无变化</span>
+        {% elif e.outcome in ("conflict","revision_mismatch","source_inconsistent") %}
+          <span class="pill conflict">{{ e.outcome }}</span>
+        {% else %}<span class="pill retracted">{{ e.outcome }}</span>{% endif %}
+      </td>
+      <td>{{ ("r" ~ e.revision) if e.revision else "—" }}</td>
+      <td class="meta">{{ e.detail }}</td>
+    </tr>
+  {% endfor %}
+  </tbody>
+</table>
+</div>
+{% else %}
+<p class="empty">尚无核对记录。</p>
+{% endif %}
+{% endblock %}

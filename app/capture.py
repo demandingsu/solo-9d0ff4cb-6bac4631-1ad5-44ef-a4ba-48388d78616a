@@ -6,6 +6,7 @@ import logging
 from .domain import (
     ArchiveError,
     CaptureResult,
+    NoticeDestroyed,
     RevisionMismatch,
     SourceInconsistent,
     SourceNotFound,
@@ -29,6 +30,22 @@ class CaptureService:
 
     def capture(self, raw_number: str) -> CaptureResult:
         number = normalize_number(raw_number)
+
+        # A destroyed announcement can never be re-captured under the same
+        # number: refuse before any network access. The store enforces the same
+        # rule inside its write transaction as a second line of defence.
+        if self.store.is_destroyed(number):
+            message = (
+                f"公告 {number} 已办理销毁并留有凭证，同号重采被拒绝；"
+                "已销毁的正文与附件不会重现。"
+            )
+            try:
+                self.store.log_event(
+                    number, "capture_blocked_destroyed", message, None
+                )
+            except ArchiveError:
+                log.exception("failed to log blocked capture for %s", number)
+            raise NoticeDestroyed(message)
 
         try:
             snapshot = self.source.fetch(number)
